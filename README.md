@@ -35,7 +35,7 @@ rails-deploy-init
 
 ```bash
 # Download the script
-curl -o rails-deploy-init https://raw.githubusercontent.com/YOUR_USERNAME/rails-deploy-init/main/rails-deploy-init
+curl -o rails-deploy-init https://raw.githubusercontent.com/AhelFliz/rails-ec2-deploy/main/rails-deploy-init
 
 # Make it executable and move to PATH
 chmod +x rails-deploy-init
@@ -44,7 +44,7 @@ sudo mv rails-deploy-init /usr/local/bin/
 
 Or with wget:
 ```bash
-sudo wget -O /usr/local/bin/rails-deploy-init https://raw.githubusercontent.com/YOUR_USERNAME/rails-deploy-init/main/rails-deploy-init
+sudo wget -O /usr/local/bin/rails-deploy-init https://raw.githubusercontent.com/AhelFliz/rails-ec2-deploy/main/rails-deploy-init
 sudo chmod +x /usr/local/bin/rails-deploy-init
 ```
 
