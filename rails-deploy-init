@@ -306,7 +306,7 @@ EOF
 generate_puma_config() {
     cat << 'EOF'
 app_dir = File.expand_path("../..", __FILE__)
-shared_dir = File.expand_path("../../shared", app_dir)
+shared_dir = File.expand_path("../shared", app_dir)
 
 rails_env = ENV.fetch("RAILS_ENV") { "production" }
 environment rails_env
