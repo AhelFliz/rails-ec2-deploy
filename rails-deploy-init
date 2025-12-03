@@ -1,0 +1,689 @@
+#!/bin/bash
+
+#===============================================================================
+# GLOBAL RAILS DEPLOY INSTALLER
+# 
+# Install this script once, then use from any Rails project:
+#   rails-deploy-init
+#
+# Installation:
+#   sudo cp rails-deploy-init /usr/local/bin/
+#   sudo chmod +x /usr/local/bin/rails-deploy-init
+#
+# Or add to your ~/.bashrc:
+#   export PATH="$PATH:/path/to/this/script"
+#===============================================================================
+
+VERSION="1.0.0"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Fixed credentials - same for all projects (defaults)
+DEPLOY_USER="rails"
+DEFAULT_PASSWORD="ZvpII4PiQF7L3X9JYjwqoz"
+DEFAULT_RUBY="3.3.0"
+
+#-------------------------------------------------------------------------------
+# FUNCTIONS
+#-------------------------------------------------------------------------------
+
+header() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}  ${BLUE}$1${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════════╝${NC}"
+}
+
+success() { echo -e "${GREEN}✓${NC} $1"; }
+warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+error() { echo -e "${RED}✗${NC} $1"; }
+info() { echo -e "${BLUE}ℹ${NC} $1"; }
+
+get_app_name() {
+    basename "$(pwd)" | sed 's/-/_/g' | tr '[:upper:]' '[:lower:]'
+}
+
+get_db_name() {
+    echo "${1}_production"
+}
+
+get_git_repo() {
+    local repo_url=$(git config --get remote.origin.url 2>/dev/null || echo "")
+    
+    # Convert HTTPS to SSH format for server deployment
+    if [[ "$repo_url" == https://github.com/* ]]; then
+        # https://github.com/user/repo.git -> git@github.com:user/repo.git
+        repo_url=$(echo "$repo_url" | sed 's|https://github.com/|git@github.com:|')
+    fi
+    
+    echo "$repo_url"
+}
+
+get_ruby_version() {
+    if [ -f ".ruby-version" ]; then
+        cat .ruby-version | tr -d '\n'
+    else
+        echo "$DEFAULT_RUBY"
+    fi
+}
+
+get_ssh_public_key() {
+    # Try common SSH key locations for server access
+    local key_files=(
+        "$HOME/.ssh/id_ed25519.pub"
+        "$HOME/.ssh/id_rsa.pub"
+        "$HOME/.ssh/id_ecdsa.pub"
+    )
+    
+    for key_file in "${key_files[@]}"; do
+        if [ -f "$key_file" ]; then
+            cat "$key_file"
+            return 0
+        fi
+    done
+    
+    echo ""
+    return 1
+}
+
+get_github_key_private() {
+    # GitHub key for git operations
+    local key_files=(
+        "$HOME/.ssh/id_ed25519_github"
+        "$HOME/.ssh/id_ed25519"
+        "$HOME/.ssh/id_rsa"
+    )
+    
+    for key_file in "${key_files[@]}"; do
+        if [ -f "$key_file" ]; then
+            cat "$key_file"
+            return 0
+        fi
+    done
+    
+    echo ""
+    return 1
+}
+
+get_github_key_public() {
+    # GitHub key public part
+    local key_files=(
+        "$HOME/.ssh/id_ed25519_github.pub"
+        "$HOME/.ssh/id_ed25519.pub"
+        "$HOME/.ssh/id_rsa.pub"
+    )
+    
+    for key_file in "${key_files[@]}"; do
+        if [ -f "$key_file" ]; then
+            cat "$key_file"
+            return 0
+        fi
+    done
+    
+    echo ""
+    return 1
+}
+
+#-------------------------------------------------------------------------------
+# GENERATORS
+#-------------------------------------------------------------------------------
+
+generate_mina_deploy() {
+    local app=$1 ip=$2 repo=$3
+    
+    cat << EOF
+require 'mina/rails'
+require 'mina/git'
+require 'mina/rbenv'
+
+set :application_name, '$app'
+set :domain, '$ip'
+set :deploy_to, '/home/rails/$app'
+set :repository, '$repo'
+set :branch, 'main'
+set :user, 'rails'
+set :forward_agent, true
+
+set :shared_dirs, fetch(:shared_dirs, []).push(
+  'log', 'tmp/pids', 'tmp/sockets', 'public/uploads', 'storage'
+)
+
+set :shared_files, fetch(:shared_files, []).push(
+  'config/database.yml', 'config/master.key', '.env'
+)
+
+task :remote_environment do
+  invoke :'rbenv:load'
+end
+
+task :setup do
+  command %{mkdir -p "#{fetch(:deploy_to)}/shared/log"}
+  command %{mkdir -p "#{fetch(:deploy_to)}/shared/tmp/pids"}
+  command %{mkdir -p "#{fetch(:deploy_to)}/shared/tmp/sockets"}
+  command %{mkdir -p "#{fetch(:deploy_to)}/shared/public/uploads"}
+  command %{mkdir -p "#{fetch(:deploy_to)}/shared/storage"}
+  command %{mkdir -p "#{fetch(:deploy_to)}/shared/config"}
+  command %{touch "#{fetch(:deploy_to)}/shared/.env"}
+end
+
+# Custom bundle install (Bundler 2.x compatible)
+task :bundle_install do
+  command %{bundle config set --local deployment true}
+  command %{bundle config set --local path vendor/bundle}
+  command %{bundle config set --local without 'development test'}
+  command %{bundle install}
+end
+
+desc "Deploy"
+task :deploy do
+  deploy do
+    invoke :'git:clone'
+    invoke :'deploy:link_shared_paths'
+    invoke :'bundle_install'
+    invoke :'rails:db_migrate'
+    invoke :'rails:assets_precompile'
+    invoke :'deploy:cleanup'
+    on :launch do
+      in_path(fetch(:current_path)) do
+        command %{mkdir -p tmp/ && touch tmp/restart.txt}
+      end
+      invoke :'puma:hard_restart'
+    end
+  end
+end
+
+namespace :puma do
+  task(:start)   { command %{sudo systemctl start puma-$app} }
+  task(:stop)    { command %{sudo systemctl stop puma-$app} }
+  task(:restart) { command %{sudo systemctl restart puma-$app} }
+  task(:status)  { command %{sudo systemctl status puma-$app} }
+  task(:hard_restart) do
+    command %{sudo systemctl stop puma-$app || true}
+    command %{sleep 2}
+    command %{sudo systemctl start puma-$app}
+    command %{sleep 2}
+    command %{sudo systemctl status puma-$app --no-pager}
+  end
+end
+
+namespace :rails do
+  task(:console) { in_path(fetch(:current_path)) { command %{#{fetch(:rails)} console} } }
+  task(:logs)    { command %{tail -f #{fetch(:deploy_to)}/shared/log/production.log} }
+end
+EOF
+}
+
+generate_nginx_config() {
+    local app=$1 domain=$2
+    
+    cat << EOF
+upstream ${app}_puma {
+    server 127.0.0.1:3000 fail_timeout=0;
+}
+
+server {
+    listen 80;
+    server_name $domain;
+
+    root /home/rails/$app/current/public;
+
+    access_log /var/log/nginx/${app}_access.log;
+    error_log /var/log/nginx/${app}_error.log;
+
+    client_max_body_size 100M;
+
+    # Serve static assets
+    location ^~ /assets/ {
+        gzip_static on;
+        expires max;
+        add_header Cache-Control public;
+        try_files \$uri @puma;
+    }
+
+    # Serve other static files (CSS, JS, images, fonts)
+    location ~* \.(ico|css|js|gif|jpe?g|png|svg|woff|woff2|ttf|eot)\$ {
+        expires max;
+        add_header Cache-Control public;
+        try_files \$uri @puma;
+    }
+
+    try_files \$uri/index.html \$uri @puma;
+
+    location @puma {
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Host \$http_host;
+        proxy_redirect off;
+        proxy_pass http://${app}_puma;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    error_page 500 502 503 504 /500.html;
+}
+EOF
+}
+
+generate_puma_service() {
+    local app=$1
+    
+    cat << EOF
+[Unit]
+Description=Puma HTTP Server for $app
+After=network.target
+
+[Service]
+Type=simple
+User=rails
+WorkingDirectory=/home/rails/$app/current
+Environment=RAILS_ENV=production
+Environment=RACK_ENV=production
+
+ExecStart=/home/rails/.rbenv/bin/rbenv exec bundle exec puma -C /home/rails/$app/current/config/puma.rb
+ExecReload=/bin/kill -TSTP \$MAINPID
+ExecStop=/bin/kill -TERM \$MAINPID
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/home/rails/$app/shared/log/puma.log
+StandardError=append:/home/rails/$app/shared/log/puma_error.log
+
+SyslogIdentifier=puma-$app
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+generate_puma_config() {
+    cat << 'EOF'
+app_dir = File.expand_path("../..", __FILE__)
+shared_dir = File.expand_path("../../shared", app_dir)
+
+rails_env = ENV.fetch("RAILS_ENV") { "production" }
+environment rails_env
+
+if rails_env == "production"
+  workers ENV.fetch("WEB_CONCURRENCY") { 2 }
+  threads_count = ENV.fetch("RAILS_MAX_THREADS") { 5 }
+  threads threads_count, threads_count
+  preload_app!
+  
+  # Use TCP port (matches nginx upstream)
+  bind "tcp://127.0.0.1:3000"
+  
+  pidfile "#{shared_dir}/tmp/pids/puma.pid"
+  state_path "#{shared_dir}/tmp/pids/puma.state"
+  stdout_redirect "#{shared_dir}/log/puma.log", "#{shared_dir}/log/puma_error.log", true
+  
+  on_worker_boot do
+    ActiveRecord::Base.establish_connection if defined?(ActiveRecord)
+  end
+else
+  threads_count = ENV.fetch("RAILS_MAX_THREADS") { 5 }
+  threads threads_count, threads_count
+  port ENV.fetch("PORT") { 3000 }
+end
+
+plugin :tmp_restart
+EOF
+}
+
+generate_database_yml() {
+    local db=$1 pass=$2
+    
+    cat << EOF
+production:
+  adapter: postgresql
+  encoding: unicode
+  database: $db
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  username: rails
+  password: $pass
+  host: localhost
+EOF
+}
+
+generate_server_setup() {
+    local app=$1 db=$2 ruby=$3 pass=$4 ssh_key=$5 github_key_priv_b64=$6 github_key_pub=$7
+    
+    cat << EOF
+#!/bin/bash
+set -e
+
+APP="$app"
+DB="$db"
+USER="rails"
+PASS="$pass"
+RUBY="$ruby"
+
+# SSH Public Key from local machine (for server access)
+SSH_PUBLIC_KEY="$ssh_key"
+
+# GitHub SSH Key from local machine (base64 encoded private key)
+GITHUB_KEY_PRIVATE_B64="$github_key_priv_b64"
+GITHUB_KEY_PUBLIC="$github_key_pub"
+
+echo "Setting up server for: \$APP"
+
+# System update
+sudo apt update && sudo apt upgrade -y
+
+# Dependencies
+sudo apt install -y git curl libssl-dev libreadline-dev zlib1g-dev \\
+    autoconf bison build-essential libyaml-dev libncurses5-dev \\
+    libffi-dev libgdbm-dev postgresql postgresql-contrib libpq-dev \\
+    nginx certbot python3-certbot-nginx nodejs npm
+
+sudo npm install -g yarn
+
+# Create rails user
+if ! id "\$USER" &>/dev/null; then
+    sudo adduser --disabled-password --gecos "" \$USER
+    echo "\$USER:\$PASS" | sudo chpasswd
+    sudo usermod -aG sudo \$USER
+    echo "\$USER ALL=(ALL) NOPASSWD: /bin/systemctl start puma-\$APP, /bin/systemctl stop puma-\$APP, /bin/systemctl restart puma-\$APP, /bin/systemctl status puma-\$APP" | sudo tee /etc/sudoers.d/\$USER-puma
+fi
+
+# SSH setup for rails user
+echo "► Setting up SSH keys for rails user..."
+sudo mkdir -p /home/\$USER/.ssh
+
+# 1. Server access key (your local key)
+if [ -n "\$SSH_PUBLIC_KEY" ]; then
+    echo "\$SSH_PUBLIC_KEY" | sudo tee /home/\$USER/.ssh/authorized_keys > /dev/null
+    echo "✓ Added your SSH public key for server access"
+fi
+
+# 2. GitHub key (copied from your local machine)
+if [ -n "\$GITHUB_KEY_PRIVATE_B64" ] && [ -n "\$GITHUB_KEY_PUBLIC" ]; then
+    echo "\$GITHUB_KEY_PRIVATE_B64" | base64 -d | sudo tee /home/\$USER/.ssh/id_ed25519_github > /dev/null
+    echo "\$GITHUB_KEY_PUBLIC" | sudo tee /home/\$USER/.ssh/id_ed25519_github.pub > /dev/null
+    sudo chmod 600 /home/\$USER/.ssh/id_ed25519_github
+    sudo chmod 644 /home/\$USER/.ssh/id_ed25519_github.pub
+    
+    # Configure SSH to use this key for GitHub
+    sudo tee /home/\$USER/.ssh/config > /dev/null << 'SSHCONF'
+Host github.com
+  HostName github.com
+  IdentityFile ~/.ssh/id_ed25519_github
+  User git
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+SSHCONF
+    sudo chmod 600 /home/\$USER/.ssh/config
+    echo "✓ Added your GitHub SSH key (same as local machine)"
+else
+    echo "⚠ No GitHub key found - you'll need to set up git access manually"
+fi
+
+sudo chown -R \$USER:\$USER /home/\$USER/.ssh
+sudo chmod 700 /home/\$USER/.ssh
+sudo chmod 600 /home/\$USER/.ssh/authorized_keys 2>/dev/null || true
+
+# Test GitHub connection
+if [ -n "\$GITHUB_KEY_PRIVATE_B64" ]; then
+    echo "► Testing GitHub connection..."
+    sudo -u \$USER ssh -T git@github.com 2>&1 || true
+fi
+
+# rbenv + Ruby
+echo "► Installing Ruby \$RUBY (this may take a few minutes)..."
+sudo -u \$USER bash << 'RBENV'
+cd ~
+
+# Install rbenv
+[ ! -d "\$HOME/.rbenv" ] && git clone https://github.com/rbenv/rbenv.git ~/.rbenv
+grep -q 'rbenv/bin' ~/.bashrc || echo 'export PATH="\$HOME/.rbenv/bin:\$PATH"' >> ~/.bashrc
+grep -q 'rbenv init' ~/.bashrc || echo 'eval "\$(rbenv init -)"' >> ~/.bashrc
+[ ! -d "\$HOME/.rbenv/plugins/ruby-build" ] && git clone https://github.com/rbenv/ruby-build.git ~/.rbenv/plugins/ruby-build
+export PATH="\$HOME/.rbenv/bin:\$PATH"
+eval "\$(rbenv init -)"
+rbenv versions | grep -q "$ruby" || rbenv install $ruby
+rbenv global $ruby
+gem install bundler
+RBENV
+
+# PostgreSQL
+sudo -u postgres psql -c "DO \\\$\\\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '\$USER') THEN CREATE ROLE \$USER WITH LOGIN PASSWORD '\$PASS' CREATEDB; END IF; END \\\$\\\$;"
+sudo -u postgres createdb -O \$USER \$DB 2>/dev/null || true
+
+# App directories
+sudo mkdir -p /home/\$USER/\$APP/{shared,releases}
+sudo mkdir -p /home/\$USER/\$APP/shared/{config,log,tmp/pids,tmp/sockets,public/uploads,storage,config/credentials}
+sudo chown -R \$USER:\$USER /home/\$USER/\$APP
+
+# Install configs
+[ -f "nginx/\$APP" ] && sudo cp nginx/\$APP /etc/nginx/sites-available/ && sudo ln -sf /etc/nginx/sites-available/\$APP /etc/nginx/sites-enabled/ && sudo rm -f /etc/nginx/sites-enabled/default && sudo nginx -t && sudo systemctl reload nginx
+[ -f "systemd/puma-\$APP.service" ] && sudo cp systemd/puma-\$APP.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable puma-\$APP
+[ -f "config/database.yml" ] && sudo cp config/database.yml /home/\$USER/\$APP/shared/config/ && sudo chown \$USER:\$USER /home/\$USER/\$APP/shared/config/database.yml
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════════"
+echo "  SETUP COMPLETE!"
+echo "═══════════════════════════════════════════════════════════════════"
+echo ""
+echo "SSH access configured:"
+echo "  ssh rails@\$(hostname -I | awk '{print \$1}')"
+echo ""
+echo "GitHub access: Using your local key (no deploy key needed!)"
+echo ""
+echo "Next steps:"
+echo "  1. Add master.key to server"
+echo "  2. Run 'mina setup && mina deploy' from local"
+echo ""
+echo "Credentials:"
+echo "  User: \$USER"
+echo "  Password: \$PASS"
+echo "  Database: \$DB"
+EOF
+}
+
+generate_deploy_bin() {
+    cat << 'EOF'
+#!/bin/bash
+case "$1" in
+    setup)   bundle exec mina setup ;;
+    deploy|"") bundle exec mina deploy ;;
+    console) bundle exec mina rails:console ;;
+    logs)    bundle exec mina rails:logs ;;
+    restart) bundle exec mina puma:restart ;;
+    status)  bundle exec mina puma:status ;;
+    *)       echo "Usage: bin/deploy [setup|deploy|console|logs|restart|status]"; exit 1 ;;
+esac
+EOF
+}
+
+#-------------------------------------------------------------------------------
+# MAIN
+#-------------------------------------------------------------------------------
+
+main() {
+    header "Rails Deploy Init v$VERSION"
+    
+    # Verify Rails project
+    if [ ! -f "Gemfile" ] || ! grep -q "rails" Gemfile 2>/dev/null; then
+        error "Not a Rails project directory!"
+        exit 1
+    fi
+    
+    # Detect values
+    APP_NAME=$(get_app_name)
+    DB_NAME=$(get_db_name "$APP_NAME")
+    GIT_REPO=$(get_git_repo)
+    RUBY_VER=$(get_ruby_version)
+    SSH_KEY=$(get_ssh_public_key)
+    GITHUB_KEY_PRIV=$(get_github_key_private)
+    GITHUB_KEY_PUB=$(get_github_key_public)
+    
+    # Base64 encode the private key for safe transport
+    GITHUB_KEY_PRIV_B64=""
+    if [ -n "$GITHUB_KEY_PRIV" ]; then
+        GITHUB_KEY_PRIV_B64=$(echo "$GITHUB_KEY_PRIV" | base64 | tr -d '\n')
+    fi
+    
+    info "Detected:"
+    echo "  App:    $APP_NAME"
+    echo "  DB:     $DB_NAME"
+    echo "  Ruby:   $RUBY_VER"
+    echo "  Repo:   ${GIT_REPO:-Not detected}"
+    
+    # SSH Key status (server access)
+    if [ -n "$SSH_KEY" ]; then
+        local key_type=$(echo "$SSH_KEY" | awk '{print $1}')
+        echo -e "  SSH:    ${GREEN}✓${NC} Server access ($key_type)"
+    else
+        echo -e "  SSH:    ${YELLOW}⚠${NC} Not found"
+    fi
+    
+    # GitHub Key status
+    if [ -n "$GITHUB_KEY_PUB" ]; then
+        local gh_comment=$(echo "$GITHUB_KEY_PUB" | awk '{print $3}')
+        echo -e "  GitHub: ${GREEN}✓${NC} Found ($gh_comment)"
+    else
+        echo -e "  GitHub: ${YELLOW}⚠${NC} Not found - will need manual setup"
+    fi
+    echo ""
+    
+    # Get AWS IP
+    read -p "AWS EC2 IP: " AWS_IP
+    [ -z "$AWS_IP" ] && { error "IP required!"; exit 1; }
+    
+    read -p "Domain (or Enter for IP): " DOMAIN
+    DOMAIN=${DOMAIN:-$AWS_IP}
+    
+    # Get PEM file for initial AWS access
+    PEM_CONFIG="$HOME/.rails-deploy-pem"
+    DEFAULT_PEM=""
+    
+    # Check if we have a saved PEM path
+    if [ -f "$PEM_CONFIG" ]; then
+        DEFAULT_PEM=$(cat "$PEM_CONFIG")
+    fi
+    
+    if [ -n "$DEFAULT_PEM" ] && [ -f "$DEFAULT_PEM" ]; then
+        read -p "Path to AWS .pem key [$DEFAULT_PEM]: " PEM_PATH
+        PEM_PATH=${PEM_PATH:-$DEFAULT_PEM}
+    else
+        read -p "Path to AWS .pem key (e.g. ~/.ssh/my-key.pem): " PEM_PATH
+    fi
+    
+    PEM_PATH=$(eval echo "$PEM_PATH")  # Expand ~
+    
+    if [ ! -f "$PEM_PATH" ]; then
+        error "PEM file not found: $PEM_PATH"
+        exit 1
+    fi
+    
+    # Ensure correct permissions on PEM file
+    chmod 400 "$PEM_PATH" 2>/dev/null || true
+    
+    # Save PEM path for future use
+    echo "$PEM_PATH" > "$PEM_CONFIG"
+    
+    # Get passwords (with defaults)
+    echo ""
+    read -p "Password for rails user & sudo [$DEFAULT_PASSWORD]: " DEPLOY_PASSWORD
+    DEPLOY_PASSWORD=${DEPLOY_PASSWORD:-$DEFAULT_PASSWORD}
+    
+    header "Generating Files"
+    
+    # Create directories
+    mkdir -p config deployment/{nginx,systemd,config}
+    
+    # Generate all files
+    generate_mina_deploy "$APP_NAME" "$AWS_IP" "$GIT_REPO" > config/deploy.rb
+    success "config/deploy.rb"
+    
+    generate_nginx_config "$APP_NAME" "$DOMAIN" > "deployment/nginx/$APP_NAME"
+    success "deployment/nginx/$APP_NAME"
+    
+    generate_puma_service "$APP_NAME" > "deployment/systemd/puma-$APP_NAME.service"
+    success "deployment/systemd/puma-$APP_NAME.service"
+    
+    generate_puma_config > config/puma.rb
+    success "config/puma.rb"
+    
+    generate_database_yml "$DB_NAME" "$DEPLOY_PASSWORD" > deployment/config/database.yml
+    success "deployment/config/database.yml"
+    
+    generate_server_setup "$APP_NAME" "$DB_NAME" "$RUBY_VER" "$DEPLOY_PASSWORD" "$SSH_KEY" "$GITHUB_KEY_PRIV_B64" "$GITHUB_KEY_PUB" > deployment/server_setup.sh
+    chmod +x deployment/server_setup.sh
+    success "deployment/server_setup.sh"
+    
+    mkdir -p bin
+    generate_deploy_bin > bin/deploy
+    chmod +x bin/deploy
+    success "bin/deploy"
+    
+    # Add mina to Gemfile (check exact gem name, not substring)
+    if ! grep -qE "^gem ['\"]mina['\"]" Gemfile; then
+        echo -e "\n# Deployment\ngem 'mina', '~> 1.2'" >> Gemfile
+        success "Added mina to Gemfile"
+    fi
+    
+    echo ""
+    info "Step 4/5: Installing bundle (including mina)..."
+    bundle install || { error "Bundle install failed"; exit 1; }
+    success "Bundle installed"
+    
+    header "Deploying to Server (Automated)"
+    
+    echo ""
+    info "Step 1/5: Copying deployment files to server..."
+    scp -i "$PEM_PATH" -o StrictHostKeyChecking=no -r deployment ubuntu@$AWS_IP:~/ || { error "Failed to copy files"; exit 1; }
+    success "Files copied"
+    
+    echo ""
+    info "Step 2/5: Running server setup (this takes 5-10 minutes for Ruby install)..."
+    ssh -i "$PEM_PATH" -o StrictHostKeyChecking=no ubuntu@$AWS_IP 'cd deployment && chmod +x server_setup.sh && ./server_setup.sh' || { error "Server setup failed"; exit 1; }
+    success "Server configured"
+    
+    echo ""
+    info "Step 3/5: Copying master.key..."
+    if [ -f "config/master.key" ]; then
+        scp -i "$PEM_PATH" -o StrictHostKeyChecking=no config/master.key ubuntu@$AWS_IP:/tmp/
+        ssh -i "$PEM_PATH" -o StrictHostKeyChecking=no ubuntu@$AWS_IP "sudo mv /tmp/master.key /home/rails/$APP_NAME/shared/config/ && sudo chown rails:rails /home/rails/$APP_NAME/shared/config/master.key"
+        success "master.key copied"
+    else
+        warn "config/master.key not found - you'll need to copy it manually"
+    fi
+    
+    echo ""
+    info "Step 5/5: Running Mina setup and deploy..."
+    bundle exec mina setup || { error "Mina setup failed"; exit 1; }
+    success "Mina setup complete"
+    
+    bundle exec mina deploy || { error "Deploy failed"; exit 1; }
+    success "Deploy complete"
+    
+    header "🚀 DEPLOYMENT SUCCESSFUL!"
+    echo ""
+    echo -e "${GREEN}Your app is live at:${NC}"
+    echo "  http://$DOMAIN"
+    echo ""
+    echo -e "${CYAN}SSH access:${NC}"
+    echo "  ssh rails@$AWS_IP"
+    echo ""
+    echo -e "${CYAN}Useful commands:${NC}"
+    echo "  bin/deploy          # Deploy latest code"
+    echo "  bin/deploy logs     # View logs"
+    echo "  bin/deploy console  # Rails console"
+    echo "  bin/deploy restart  # Restart Puma"
+    echo ""
+    echo -e "${CYAN}Config:${NC}"
+    echo "  App:      $APP_NAME"
+    echo "  DB:       $DB_NAME"
+    echo "  User:     rails"
+    echo "  Password: $DEPLOY_PASSWORD"
+}
+
+main "$@"
