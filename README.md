@@ -210,6 +210,75 @@ ssh rails@YOUR_IP
 sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
 ```
 
+## Custom Domain Setup
+
+### Step 1: Configure DNS (Namecheap, GoDaddy, Cloudflare, etc.)
+
+Go to your domain provider's DNS settings and add these records:
+
+| Type | Host | Value | TTL |
+|------|------|-------|-----|
+| A Record | @ | YOUR_SERVER_IP | Automatic |
+| A Record | www | YOUR_SERVER_IP | Automatic |
+
+**Wait 5-10 minutes** for DNS propagation. You can check with:
+```bash
+dig yourdomain.com +short
+# Should return your server IP
+```
+
+### Step 2: Update Nginx Configuration
+
+```bash
+ssh rails@YOUR_IP
+sudo nano /etc/nginx/sites-available/your_app
+```
+
+Change the `server_name` line:
+```nginx
+server_name yourdomain.com www.yourdomain.com;
+```
+
+Test and reload:
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### Step 3: Install SSL Certificate
+
+```bash
+sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
+```
+
+Certbot will:
+- Obtain SSL certificate from Let's Encrypt
+- Configure Nginx for HTTPS
+- Add automatic HTTP → HTTPS redirect
+- Set up auto-renewal (certificates expire every 90 days)
+
+### Step 4: Verify SSL Auto-Renewal
+
+```bash
+sudo certbot renew --dry-run
+```
+
+### Troubleshooting DNS
+
+```bash
+# Check DNS propagation
+dig yourdomain.com +short
+nslookup yourdomain.com
+
+# Check from external service
+curl -I http://yourdomain.com
+```
+
+If DNS isn't propagating, try:
+- Clear local DNS cache: `sudo dscacheutil -flushcache` (macOS)
+- Wait longer (can take up to 48 hours in rare cases)
+- Verify records are correct in your DNS provider
+
 ## Troubleshooting
 
 ### Check Service Status
